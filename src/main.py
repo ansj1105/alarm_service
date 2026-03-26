@@ -74,10 +74,13 @@ class Monitor:
         self.states: Dict[str, AlertState] = {}
 
         self.primary_conninfo = self._build_conninfo("PRIMARY_DB")
-        self.standby_conninfo = self._build_conninfo("STANDBY_DB")
+        self.primary_db_target = self._build_target("PRIMARY_DB")
+        self.standby_conninfo = self._build_optional_conninfo("STANDBY_DB")
+        self.standby_db_target = self._build_target("STANDBY_DB") if self.standby_conninfo else "disabled"
         self.web_health_url = env("WEB_HEALTH_URL", "https://korion.io.kr/health")
         self.api_health_url = env("API_HEALTH_URL", "https://api.korion.io.kr/health")
         self.startup_message_enabled = env("STARTUP_MESSAGE_ENABLED", "true").lower() == "true"
+        self.standby_check_enabled = env("STANDBY_CHECK_ENABLED", "true").lower() == "true"
 
     def _build_conninfo(self, prefix: str) -> str:
         return " ".join([
@@ -90,6 +93,17 @@ class Monitor:
             "sslmode=prefer",
         ])
 
+    def _build_optional_conninfo(self, prefix: str) -> Optional[str]:
+        host = os.getenv(f"{prefix}_HOST", "").strip()
+        if not host:
+            return None
+        return self._build_conninfo(prefix)
+
+    def _build_target(self, prefix: str) -> str:
+        host = env(f"{prefix}_HOST")
+        port = env(f"{prefix}_PORT")
+        return f"{host}:{port}"
+
     def run(self) -> None:
         if self.startup_message_enabled:
             self.notifier.send(
@@ -98,8 +112,8 @@ class Monitor:
                     "service=alarm_service",
                     f"webHealthUrl={self.web_health_url}",
                     f"apiHealthUrl={self.api_health_url}",
-                    "primaryDb=172.31.36.110:15432",
-                    "standbyDb=127.0.0.1:15432",
+                    f"primaryDb={self.primary_db_target}",
+                    f"standbyDb={self.standby_db_target}",
                     f"criticalProbeSql={self.db_critical_probe_sql}",
                     f"catalogProbeSql={self.db_catalog_probe_sql}",
                 ]),
@@ -109,24 +123,13 @@ class Monitor:
             "web_health": self.check_web_health,
             "api_health": self.check_api_health,
             "primary_db": self.check_primary_db,
-            "standby_db": self.check_standby_db,
         }
+        if self.standby_conninfo and self.standby_check_enabled:
+            checks["standby_db"] = self.check_standby_db
 
         while True:
             for key, check in checks.items():
-                try:
-                    self.process_result(key, check())
-                except Exception as exc:
-                    self.process_result(
-                        key,
-                        CheckResult(
-                            ok=False,
-                            title=f"[KORION] External Monitor Failed - {key}",
-                            body=f"error={type(exc).__name__}: {exc}",
-                            recovery_title=f"[KORION] External Monitor Recovered - {key}",
-                            recovery_body="status=ok",
-                        ),
-                    )
+                self.process_result(key, check())
             time.sleep(self.poll_interval_seconds)
 
     def process_result(self, key: str, result: CheckResult) -> None:
@@ -179,25 +182,37 @@ class Monitor:
             )
 
     def check_primary_db(self) -> CheckResult:
-        with psycopg.connect(self.primary_conninfo) as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT
-                      current_database(),
-                      pg_is_in_recovery(),
-                      current_setting('transaction_read_only'),
-                      COALESCE(current_setting('synchronous_standby_names', true), ''),
-                      COALESCE((SELECT COUNT(*) FROM pg_stat_replication WHERE state = 'streaming'), 0),
-                      COALESCE((SELECT COUNT(*) FROM pg_stat_replication WHERE state = 'streaming' AND sync_state IN ('sync', 'quorum')), 0)
-                    """
-                )
-                database_name, in_recovery, read_only, standby_names, streaming_replicas, healthy_sync = cur.fetchone()
+        try:
+            with psycopg.connect(self.primary_conninfo) as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT
+                          current_database(),
+                          pg_is_in_recovery(),
+                          current_setting('transaction_read_only'),
+                          COALESCE(current_setting('synchronous_standby_names', true), ''),
+                          COALESCE((SELECT COUNT(*) FROM pg_stat_replication WHERE state = 'streaming'), 0),
+                          COALESCE((SELECT COUNT(*) FROM pg_stat_replication WHERE state = 'streaming' AND sync_state IN ('sync', 'quorum')), 0)
+                        """
+                    )
+                    database_name, in_recovery, read_only, standby_names, streaming_replicas, healthy_sync = cur.fetchone()
 
-                cur.execute(self.db_critical_probe_sql)
-                cur.fetchone()
-                cur.execute(self.db_catalog_probe_sql)
-                cur.fetchone()
+                    cur.execute(self.db_critical_probe_sql)
+                    cur.fetchone()
+                    cur.execute(self.db_catalog_probe_sql)
+                    cur.fetchone()
+        except Exception as exc:
+            return CheckResult(
+                ok=False,
+                title="[KORION] External Alert - Primary DB Failed",
+                body="\n".join([
+                    f"target={self.primary_db_target}",
+                    f"error={type(exc).__name__}: {exc}",
+                ]),
+                recovery_title="[KORION] External Recovered - Primary DB Failed",
+                recovery_body=f"target={self.primary_db_target}\nstatus=ok",
+            )
 
         failures = []
         if in_recovery:
@@ -232,18 +247,38 @@ class Monitor:
         )
 
     def check_standby_db(self) -> CheckResult:
-        with psycopg.connect(self.standby_conninfo) as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT
-                      current_database(),
-                      pg_is_in_recovery(),
-                      current_setting('transaction_read_only'),
-                      EXTRACT(EPOCH FROM COALESCE(now() - pg_last_xact_replay_timestamp(), interval '0 second'))::bigint
-                    """
-                )
-                database_name, in_recovery, read_only, replay_lag_seconds = cur.fetchone()
+        if not self.standby_conninfo or not self.standby_check_enabled:
+            return CheckResult(
+                ok=True,
+                title="[KORION] External Alert - Standby DB Failed",
+                body="status=disabled",
+                recovery_title="[KORION] External Recovered - Standby DB Failed",
+                recovery_body="status=disabled",
+            )
+        try:
+            with psycopg.connect(self.standby_conninfo) as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT
+                          current_database(),
+                          pg_is_in_recovery(),
+                          current_setting('transaction_read_only'),
+                          EXTRACT(EPOCH FROM COALESCE(now() - pg_last_xact_replay_timestamp(), interval '0 second'))::bigint
+                        """
+                    )
+                    database_name, in_recovery, read_only, replay_lag_seconds = cur.fetchone()
+        except Exception as exc:
+            return CheckResult(
+                ok=False,
+                title="[KORION] External Alert - Standby DB Failed",
+                body="\n".join([
+                    f"target={self.standby_db_target}",
+                    f"error={type(exc).__name__}: {exc}",
+                ]),
+                recovery_title="[KORION] External Recovered - Standby DB Failed",
+                recovery_body=f"target={self.standby_db_target}\nstatus=ok",
+            )
 
         failures = []
         if not in_recovery:
