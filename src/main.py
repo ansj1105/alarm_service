@@ -77,6 +77,7 @@ class Monitor:
         self.standby_conninfo = self._build_conninfo("STANDBY_DB")
         self.web_health_url = env("WEB_HEALTH_URL", "https://korion.io.kr/health")
         self.api_health_url = env("API_HEALTH_URL", "https://api.korion.io.kr/health")
+        self.startup_message_enabled = env("STARTUP_MESSAGE_ENABLED", "true").lower() == "true"
 
     def _build_conninfo(self, prefix: str) -> str:
         return " ".join([
@@ -90,6 +91,20 @@ class Monitor:
         ])
 
     def run(self) -> None:
+        if self.startup_message_enabled:
+            self.notifier.send(
+                "[KORION] External Monitor Started",
+                "\n".join([
+                    "service=alarm_service",
+                    f"webHealthUrl={self.web_health_url}",
+                    f"apiHealthUrl={self.api_health_url}",
+                    "primaryDb=172.31.36.110:15432",
+                    "standbyDb=127.0.0.1:15432",
+                    f"criticalProbeSql={self.db_critical_probe_sql}",
+                    f"catalogProbeSql={self.db_catalog_probe_sql}",
+                ]),
+            )
+
         checks: Dict[str, Callable[[], CheckResult]] = {
             "web_health": self.check_web_health,
             "api_health": self.check_api_health,
