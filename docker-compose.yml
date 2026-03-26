@@ -1,0 +1,7 @@
+services:
+  alarm-service:
+    build: .
+    container_name: fox-coin-alarm-service
+    restart: unless-stopped
+    env_file:
+      - .env
