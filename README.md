@@ -42,6 +42,7 @@ FOXYA_SSH_KEY_PATH=/run/secrets/korion.pem
 ```bash
 OFFLINE_PAY_RUNTIME_CHECK_ENABLED=true
 OFFLINE_PAY_SSH_HOST=98.91.96.182
+OFFLINE_PAY_SSH_KEY_SOURCE=/home/ubuntu/.ssh/korion.pem
 OFFLINE_PAY_SSH_KEY_PATH=/run/secrets/korion.pem
 OFFLINE_PAY_LOG_CONTAINERS=korion_offline-app-api-1,korion_offline-app-worker-1
 ```

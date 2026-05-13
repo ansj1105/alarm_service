@@ -7,3 +7,4 @@ services:
       - .env
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ${OFFLINE_PAY_SSH_KEY_SOURCE:-/home/ubuntu/.ssh/korion.pem}:${OFFLINE_PAY_SSH_KEY_PATH:-/run/secrets/korion.pem}:ro
