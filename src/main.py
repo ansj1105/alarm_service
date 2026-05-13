@@ -119,12 +119,16 @@ class Monitor:
                 "Failed to read any response from the server",
                 "Connection is closed",
                 "Connection refused: db-proxy",
+                "Connection refused: db-proxy/.*5432",
                 "connect ECONNREFUSED",
                 "Connection terminated unexpectedly",
                 "UnknownHostException",
                 "Failed to resolve 'redis'",
                 "Failed to connect to Redis",
                 "Failed to start MainVerticle",
+                "backend-unresolved",
+                "runtime-conflict",
+                "status:restarting",
                 "postgres.*NOSRV",
                 "could not resolve address.*postgres",
                 "server postgres/primary is DOWN",
@@ -133,6 +137,41 @@ class Monitor:
         self.foxya_ignored_log_patterns = env_list(
             "FOXYA_IGNORED_LOG_PATTERNS",
             "Unauthorized,프로필 이미지를 찾을 수 없습니다",
+        )
+        self.offline_pay_runtime_check_enabled = env(
+            "OFFLINE_PAY_RUNTIME_CHECK_ENABLED",
+            "false",
+        ).lower() == "true"
+        self.offline_pay_ssh_host = env("OFFLINE_PAY_SSH_HOST", "98.91.96.182")
+        self.offline_pay_ssh_user = env("OFFLINE_PAY_SSH_USER", "ubuntu")
+        self.offline_pay_ssh_port = env_int("OFFLINE_PAY_SSH_PORT", 22)
+        self.offline_pay_ssh_key_path = env("OFFLINE_PAY_SSH_KEY_PATH", "")
+        self.offline_pay_ssh_timeout_seconds = env_int("OFFLINE_PAY_SSH_TIMEOUT_SECONDS", 15)
+        self.offline_pay_log_containers = env_list(
+            "OFFLINE_PAY_LOG_CONTAINERS",
+            "korion_offline-app-api-1,korion_offline-app-worker-1",
+        )
+        self.offline_pay_log_lookback_minutes = env_int("OFFLINE_PAY_LOG_LOOKBACK_MINUTES", 10)
+        self.offline_pay_critical_log_patterns = env_list(
+            "OFFLINE_PAY_CRITICAL_LOG_PATTERNS",
+            ",".join([
+                "Offline Pay Settlement Dead Letter",
+                "offline_pay\\.collateral\\.dead_letter",
+                "COLLATERAL_LOCK_FAIL",
+                "INSUFFICIENT_BALANCE",
+                "Failed to request settlement",
+                "HISTORY_SYNC_FAIL",
+                "RECEIVER_HISTORY_SYNC_REQUESTED",
+                "value too long for type character varying",
+                "circuit opened",
+                "coin_manage collateral request failed",
+                "foxya.*status 5[0-9][0-9]",
+                "coin_manage.*status 5[0-9][0-9]",
+            ]),
+        )
+        self.offline_pay_ignored_log_patterns = env_list(
+            "OFFLINE_PAY_IGNORED_LOG_PATTERNS",
+            "",
         )
 
     def _build_conninfo(self, prefix: str) -> str:
@@ -172,6 +211,8 @@ class Monitor:
                     f"foxyaRuntimeCheckEnabled={self.foxya_runtime_check_enabled}",
                     f"foxyaDockerCheckMode={self.foxya_docker_check_mode}",
                     f"foxyaSshHost={self.foxya_ssh_host}",
+                    f"offlinePayRuntimeCheckEnabled={self.offline_pay_runtime_check_enabled}",
+                    f"offlinePaySshHost={self.offline_pay_ssh_host}",
                 ]),
             )
 
@@ -185,6 +226,8 @@ class Monitor:
         if self.foxya_runtime_check_enabled:
             checks["foxya_runtime"] = self.check_foxya_runtime
             checks["foxya_critical_logs"] = self.check_foxya_critical_logs
+        if self.offline_pay_runtime_check_enabled:
+            checks["offline_pay_critical_logs"] = self.check_offline_pay_critical_logs
 
         while True:
             for key, check in checks.items():
@@ -404,6 +447,38 @@ class Monitor:
             )
         return self._run_foxya_ssh(remote_command)
 
+    def _ssh_command(
+        self,
+        *,
+        user: str,
+        host: str,
+        port: int,
+        key_path: str,
+        timeout_seconds: int,
+        remote_command: str,
+    ) -> subprocess.CompletedProcess[str]:
+        command = [
+            "ssh",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            f"ConnectTimeout={timeout_seconds}",
+            "-p",
+            str(port),
+        ]
+        if key_path:
+            command.extend(["-i", key_path])
+        command.extend([f"{user}@{host}", remote_command])
+        return subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds + 10,
+        )
+
     def _docker_socket_request(self, path: str) -> tuple[int, bytes]:
         class UnixSocketHTTPConnection(http.client.HTTPConnection):
             def __init__(self, socket_path: str, timeout: int) -> None:
@@ -621,6 +696,73 @@ class Monitor:
             title="[KORION] External Alert - Foxya Critical Logs",
             body="\n".join(body_lines),
             recovery_title="[KORION] External Recovered - Foxya Critical Logs",
+            recovery_body="\n".join(body_lines[:3] + ["status=no recent critical log pattern"]),
+        )
+
+    def check_offline_pay_critical_logs(self) -> CheckResult:
+        if not self.offline_pay_critical_log_patterns:
+            return CheckResult(
+                ok=True,
+                title="[KORION] External Alert - Offline Pay Critical Logs",
+                body="status=disabled",
+                recovery_title="[KORION] External Recovered - Offline Pay Critical Logs",
+                recovery_body="status=disabled",
+            )
+
+        pattern = "|".join(f"({item})" for item in self.offline_pay_critical_log_patterns)
+        ignored_pattern = "|".join(f"({item})" for item in self.offline_pay_ignored_log_patterns)
+        quoted_names = " ".join(shlex.quote(name) for name in self.offline_pay_log_containers)
+        remote_command = (
+            "for name in " + quoted_names + "; do "
+            f"sudo docker logs --since {self.offline_pay_log_lookback_minutes}m \"$name\" 2>&1 "
+            f"| grep -E -i {shlex.quote(pattern)} "
+        )
+        if ignored_pattern:
+            remote_command += f"| grep -E -i -v {shlex.quote(ignored_pattern)} "
+        remote_command += "| tail -n 20 | sed \"s/^/[$name] /\"; done"
+
+        try:
+            result = self._ssh_command(
+                user=self.offline_pay_ssh_user,
+                host=self.offline_pay_ssh_host,
+                port=self.offline_pay_ssh_port,
+                key_path=self.offline_pay_ssh_key_path,
+                timeout_seconds=self.offline_pay_ssh_timeout_seconds,
+                remote_command=remote_command,
+            )
+        except Exception as exc:
+            return CheckResult(
+                ok=False,
+                title="[KORION] External Alert - Offline Pay Critical Logs",
+                body=f"target={self.offline_pay_ssh_user}@{self.offline_pay_ssh_host}\nerror={type(exc).__name__}: {exc}",
+                recovery_title="[KORION] External Recovered - Offline Pay Critical Logs",
+                recovery_body=f"target={self.offline_pay_ssh_user}@{self.offline_pay_ssh_host}\nstatus=ok",
+            )
+
+        if result.returncode not in (0, 1):
+            return CheckResult(
+                ok=False,
+                title="[KORION] External Alert - Offline Pay Critical Logs",
+                body="\n".join([
+                    f"target={self.offline_pay_ssh_user}@{self.offline_pay_ssh_host}",
+                    f"ssh_exit={result.returncode}",
+                    f"stderr={result.stderr.strip()}",
+                ]),
+                recovery_title="[KORION] External Recovered - Offline Pay Critical Logs",
+                recovery_body=f"target={self.offline_pay_ssh_user}@{self.offline_pay_ssh_host}\nstatus=ok",
+            )
+
+        matched_lines = [line for line in result.stdout.splitlines() if line.strip()]
+        body_lines = [
+            f"target={self.offline_pay_ssh_user}@{self.offline_pay_ssh_host}",
+            f"lookbackMinutes={self.offline_pay_log_lookback_minutes}",
+            f"containers={','.join(self.offline_pay_log_containers)}",
+        ] + matched_lines[-50:]
+        return CheckResult(
+            ok=not matched_lines,
+            title="[KORION] External Alert - Offline Pay Critical Logs",
+            body="\n".join(body_lines),
+            recovery_title="[KORION] External Recovered - Offline Pay Critical Logs",
             recovery_body="\n".join(body_lines[:3] + ["status=no recent critical log pattern"]),
         )
 
