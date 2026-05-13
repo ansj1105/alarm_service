@@ -5,6 +5,7 @@ import http.client
 import json
 import re
 import shlex
+import shutil
 import socket
 import subprocess
 import time
@@ -506,6 +507,7 @@ class Monitor:
         )
 
     def _ssh_base_command(self) -> list[str]:
+        key_path = self._prepare_ssh_key_path(self.foxya_ssh_key_path)
         command = [
             "ssh",
             "-o",
@@ -517,14 +519,18 @@ class Monitor:
             "-p",
             str(self.foxya_ssh_port),
         ]
-        if self.foxya_ssh_key_path:
-            command.extend(["-i", self.foxya_ssh_key_path])
+        if key_path:
+            command.extend(["-i", key_path])
         command.append(f"{self.foxya_ssh_user}@{self.foxya_ssh_host}")
         return command
 
     def _run_foxya_ssh(self, remote_command: str) -> subprocess.CompletedProcess[str]:
+        command = self._ssh_base_command() + [remote_command]
+        invalid_key_result = self._invalid_ssh_key_result(command, self.foxya_ssh_key_path)
+        if invalid_key_result is not None:
+            return invalid_key_result
         return subprocess.run(
-            self._ssh_base_command() + [remote_command],
+            command,
             check=False,
             capture_output=True,
             text=True,
@@ -552,6 +558,7 @@ class Monitor:
         timeout_seconds: int,
         remote_command: str,
     ) -> subprocess.CompletedProcess[str]:
+        prepared_key_path = self._prepare_ssh_key_path(key_path)
         command = [
             "ssh",
             "-o",
@@ -563,9 +570,12 @@ class Monitor:
             "-p",
             str(port),
         ]
-        if key_path:
-            command.extend(["-i", key_path])
+        if prepared_key_path:
+            command.extend(["-i", prepared_key_path])
         command.extend([f"{user}@{host}", remote_command])
+        invalid_key_result = self._invalid_ssh_key_result(command, key_path)
+        if invalid_key_result is not None:
+            return invalid_key_result
         return subprocess.run(
             command,
             check=False,
@@ -573,6 +583,44 @@ class Monitor:
             text=True,
             timeout=timeout_seconds + 10,
         )
+
+    def _prepare_ssh_key_path(self, key_path: str) -> str:
+        if not key_path or not os.path.isfile(key_path):
+            return key_path
+
+        key_stat = os.stat(key_path)
+        if key_stat.st_mode & 0o077 == 0:
+            return key_path
+
+        safe_dir = "/tmp/alarm-service-ssh"
+        safe_path = os.path.join(safe_dir, os.path.basename(key_path))
+        os.makedirs(safe_dir, mode=0o700, exist_ok=True)
+        shutil.copyfile(key_path, safe_path)
+        os.chmod(safe_path, 0o600)
+        return safe_path
+
+    def _invalid_ssh_key_result(
+        self,
+        command: list[str],
+        key_path: str,
+    ) -> Optional[subprocess.CompletedProcess[str]]:
+        if not key_path:
+            return None
+        if os.path.isdir(key_path):
+            return subprocess.CompletedProcess(
+                args=command,
+                returncode=255,
+                stdout="",
+                stderr=f"SSH key path is a directory: {key_path}",
+            )
+        if not os.path.exists(key_path):
+            return subprocess.CompletedProcess(
+                args=command,
+                returncode=255,
+                stdout="",
+                stderr=f"SSH key path does not exist: {key_path}",
+            )
+        return None
 
     def _docker_socket_request(self, path: str) -> tuple[int, bytes]:
         class UnixSocketHTTPConnection(http.client.HTTPConnection):
