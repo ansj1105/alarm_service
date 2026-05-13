@@ -12,7 +12,7 @@ Fox Coin 외부 감시용 텔레그램 알림 서비스입니다.
 - 선택형 Foxya SSH 런타임 상태
   - `foxya-api`, `foxya-api-2`, `foxya-db-proxy`, PostgreSQL, Redis 컨테이너 상태
   - 최근 로그의 DB proxy/Redis/DNS/DB connection 치명 패턴
-- 예: `ClosedConnectionException`, `Failed to read any response from the server`, `Connection is closed`, `Connection refused: db-proxy`, `connect ECONNREFUSED`, `Connection terminated unexpectedly`, `UnknownHostException`, `Failed to resolve 'redis'`, `backend-unresolved`, `runtime-conflict`, `postgres.*NOSRV`
+- 예: `ClosedConnectionException`, `Failed to read any response from the server`, `Connection refused: db-proxy`, `connect ECONNREFUSED`, `Connection terminated unexpectedly`, `UnknownHostException`, `Failed to resolve 'redis'`, `backend-unresolved`, `runtime-conflict`, `postgres.*NOSRV`
 - 선택형 `offline_pay` SSH 로그 상태
   - settlement/collateral dead-letter, 담보 부족, receiver history sync, Foxya/coin_manage 5xx 연동 실패 패턴
   - 예: `Offline Pay Settlement Dead Letter`, `offline_pay.collateral.dead_letter`, `COLLATERAL_LOCK_FAIL`, `INSUFFICIENT_BALANCE`, `Failed to request settlement`, `HISTORY_SYNC_FAIL`

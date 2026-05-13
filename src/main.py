@@ -129,7 +129,6 @@ class Monitor:
             ",".join([
                 "ClosedConnectionException",
                 "Failed to read any response from the server",
-                "Connection is closed",
                 "Connection refused: db-proxy",
                 "Connection refused: db-proxy/.*5432",
                 "connect ECONNREFUSED",
@@ -148,7 +147,7 @@ class Monitor:
         )
         self.foxya_ignored_log_patterns = env_list(
             "FOXYA_IGNORED_LOG_PATTERNS",
-            "Unauthorized,프로필 이미지를 찾을 수 없습니다",
+            "Unauthorized,프로필 이미지를 찾을 수 없습니다,NoStackTraceThrowable: Connection is closed",
         )
         self.offline_pay_runtime_check_enabled = env(
             "OFFLINE_PAY_RUNTIME_CHECK_ENABLED",
