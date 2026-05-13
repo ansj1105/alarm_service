@@ -1,6 +1,12 @@
 from __future__ import annotations
 
 import os
+import http.client
+import json
+import re
+import shlex
+import socket
+import subprocess
 import time
 from dataclasses import dataclass
 from typing import Callable, Dict, Optional
@@ -21,6 +27,11 @@ def env_int(name: str, default: int) -> int:
         return int(os.getenv(name, str(default)))
     except ValueError:
         return default
+
+
+def env_list(name: str, default: str) -> list[str]:
+    value = os.getenv(name, default)
+    return [item.strip() for item in value.split(",") if item.strip()]
 
 
 @dataclass
@@ -81,6 +92,45 @@ class Monitor:
         self.api_health_url = env("API_HEALTH_URL", "https://api.korion.io.kr/health")
         self.startup_message_enabled = env("STARTUP_MESSAGE_ENABLED", "true").lower() == "true"
         self.standby_check_enabled = env("STANDBY_CHECK_ENABLED", "true").lower() == "true"
+        self.foxya_runtime_check_enabled = os.getenv(
+            "FOXYA_RUNTIME_CHECK_ENABLED",
+            os.getenv("FOXYA_SSH_CHECK_ENABLED", "false"),
+        ).lower() == "true"
+        self.foxya_docker_check_mode = env("FOXYA_DOCKER_CHECK_MODE", "ssh").lower()
+        self.foxya_docker_socket_path = env("FOXYA_DOCKER_SOCKET_PATH", "/var/run/docker.sock")
+        self.foxya_ssh_host = env("FOXYA_SSH_HOST", "52.200.97.155")
+        self.foxya_ssh_user = env("FOXYA_SSH_USER", "ubuntu")
+        self.foxya_ssh_port = env_int("FOXYA_SSH_PORT", 22)
+        self.foxya_ssh_key_path = env("FOXYA_SSH_KEY_PATH", "")
+        self.foxya_ssh_timeout_seconds = env_int("FOXYA_SSH_TIMEOUT_SECONDS", 15)
+        self.foxya_docker_containers = env_list(
+            "FOXYA_DOCKER_CONTAINERS",
+            "foxya-coin-api,foxya-api-2,foxya-db-proxy,foxya-coin-postgres,foxya-coin-redis",
+        )
+        self.foxya_log_containers = env_list(
+            "FOXYA_LOG_CONTAINERS",
+            "foxya-coin-api,foxya-api-2,foxya-db-proxy",
+        )
+        self.foxya_log_lookback_minutes = env_int("FOXYA_LOG_LOOKBACK_MINUTES", 10)
+        self.foxya_critical_log_patterns = env_list(
+            "FOXYA_CRITICAL_LOG_PATTERNS",
+            ",".join([
+                "ClosedConnectionException",
+                "Failed to read any response from the server",
+                "Connection is closed",
+                "UnknownHostException",
+                "Failed to resolve 'redis'",
+                "Failed to connect to Redis",
+                "Failed to start MainVerticle",
+                "postgres.*NOSRV",
+                "could not resolve address.*postgres",
+                "server postgres/primary is DOWN",
+            ]),
+        )
+        self.foxya_ignored_log_patterns = env_list(
+            "FOXYA_IGNORED_LOG_PATTERNS",
+            "Unauthorized,프로필 이미지를 찾을 수 없습니다",
+        )
 
     def _build_conninfo(self, prefix: str) -> str:
         return " ".join([
@@ -116,6 +166,9 @@ class Monitor:
                     f"standbyDb={self.standby_db_target}",
                     f"criticalProbeSql={self.db_critical_probe_sql}",
                     f"catalogProbeSql={self.db_catalog_probe_sql}",
+                    f"foxyaRuntimeCheckEnabled={self.foxya_runtime_check_enabled}",
+                    f"foxyaDockerCheckMode={self.foxya_docker_check_mode}",
+                    f"foxyaSshHost={self.foxya_ssh_host}",
                 ]),
             )
 
@@ -126,6 +179,9 @@ class Monitor:
         }
         if self.standby_conninfo and self.standby_check_enabled:
             checks["standby_db"] = self.check_standby_db
+        if self.foxya_runtime_check_enabled:
+            checks["foxya_runtime"] = self.check_foxya_runtime
+            checks["foxya_critical_logs"] = self.check_foxya_critical_logs
 
         while True:
             for key, check in checks.items():
@@ -306,6 +362,263 @@ class Monitor:
                 f"database={database_name}",
                 f"replay_lag_seconds={replay_lag_seconds}",
             ]),
+        )
+
+    def _ssh_base_command(self) -> list[str]:
+        command = [
+            "ssh",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            f"ConnectTimeout={self.foxya_ssh_timeout_seconds}",
+            "-p",
+            str(self.foxya_ssh_port),
+        ]
+        if self.foxya_ssh_key_path:
+            command.extend(["-i", self.foxya_ssh_key_path])
+        command.append(f"{self.foxya_ssh_user}@{self.foxya_ssh_host}")
+        return command
+
+    def _run_foxya_ssh(self, remote_command: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            self._ssh_base_command() + [remote_command],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=self.foxya_ssh_timeout_seconds + 10,
+        )
+
+    def _run_foxya_command(self, remote_command: str) -> subprocess.CompletedProcess[str]:
+        if self.foxya_docker_check_mode == "local":
+            return subprocess.run(
+                ["bash", "-lc", remote_command],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=self.foxya_ssh_timeout_seconds + 10,
+            )
+        return self._run_foxya_ssh(remote_command)
+
+    def _docker_socket_request(self, path: str) -> tuple[int, bytes]:
+        class UnixSocketHTTPConnection(http.client.HTTPConnection):
+            def __init__(self, socket_path: str, timeout: int) -> None:
+                super().__init__("localhost", timeout=timeout)
+                self.socket_path = socket_path
+
+            def connect(self) -> None:
+                self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                self.sock.settimeout(self.timeout)
+                self.sock.connect(self.socket_path)
+
+        connection = UnixSocketHTTPConnection(self.foxya_docker_socket_path, self.foxya_ssh_timeout_seconds)
+        try:
+            connection.request("GET", path)
+            response = connection.getresponse()
+            return response.status, response.read()
+        finally:
+            connection.close()
+
+    def _docker_socket_container_status(self, name: str) -> tuple[str, str]:
+        status, body = self._docker_socket_request(f"/containers/{name}/json")
+        if status == 404:
+            return "missing", "missing"
+        if status < 200 or status >= 300:
+            return f"http_{status}", "unknown"
+        payload = json.loads(body.decode("utf-8"))
+        state = payload.get("State") or {}
+        health = (state.get("Health") or {}).get("Status") or "no-healthcheck"
+        return str(state.get("Status") or "unknown"), str(health)
+
+    def _docker_socket_container_logs(self, name: str) -> str:
+        since = max(0, int(time.time()) - self.foxya_log_lookback_minutes * 60)
+        status, body = self._docker_socket_request(
+            f"/containers/{name}/logs?stdout=1&stderr=1&timestamps=1&since={since}"
+        )
+        if status < 200 or status >= 300:
+            return f"docker_socket_log_error status={status}"
+        return body.decode("utf-8", errors="replace")
+
+    def check_foxya_runtime(self) -> CheckResult:
+        if self.foxya_docker_check_mode == "socket":
+            lines = []
+            failures = []
+            try:
+                for name in self.foxya_docker_containers:
+                    status, health = self._docker_socket_container_status(name)
+                    line = f"{name} {status} {health}"
+                    lines.append(line)
+                    if status != "running":
+                        failures.append(f"{name}=status:{status}")
+                    elif health not in ("healthy", "no-healthcheck"):
+                        failures.append(f"{name}=health:{health}")
+            except Exception as exc:
+                return CheckResult(
+                    ok=False,
+                    title="[KORION] External Alert - Foxya Runtime Failed",
+                    body=f"dockerSocket={self.foxya_docker_socket_path}\nerror={type(exc).__name__}: {exc}",
+                    recovery_title="[KORION] External Recovered - Foxya Runtime Failed",
+                    recovery_body=f"dockerSocket={self.foxya_docker_socket_path}\nstatus=ok",
+                )
+
+            body = "\n".join([
+                f"dockerSocket={self.foxya_docker_socket_path}",
+                f"containers={','.join(self.foxya_docker_containers)}",
+                *lines,
+                *failures,
+            ])
+            return CheckResult(
+                ok=not failures,
+                title="[KORION] External Alert - Foxya Runtime Failed",
+                body=body,
+                recovery_title="[KORION] External Recovered - Foxya Runtime Failed",
+                recovery_body="\n".join([
+                    f"dockerSocket={self.foxya_docker_socket_path}",
+                    "status=ok",
+                    *lines,
+                ]),
+            )
+
+        quoted_names = " ".join(shlex.quote(name) for name in self.foxya_docker_containers)
+        remote_command = (
+            "for name in " + quoted_names + "; do "
+            "status=$(sudo docker inspect -f '{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{else}}no-healthcheck{{end}}' \"$name\" 2>/dev/null) || "
+            "status=missing; "
+            "echo \"$name $status\"; "
+            "done"
+        )
+        try:
+            result = self._run_foxya_command(remote_command)
+        except Exception as exc:
+            return CheckResult(
+                ok=False,
+                title="[KORION] External Alert - Foxya Runtime Failed",
+                body=f"target={self.foxya_ssh_user}@{self.foxya_ssh_host}\nerror={type(exc).__name__}: {exc}",
+                recovery_title="[KORION] External Recovered - Foxya Runtime Failed",
+                recovery_body=f"target={self.foxya_ssh_user}@{self.foxya_ssh_host}\nstatus=ok",
+            )
+
+        if result.returncode != 0:
+            return CheckResult(
+                ok=False,
+                title="[KORION] External Alert - Foxya Runtime Failed",
+                body=f"target={self.foxya_ssh_user}@{self.foxya_ssh_host}\nssh_exit={result.returncode}\nstderr={result.stderr.strip()}",
+                recovery_title="[KORION] External Recovered - Foxya Runtime Failed",
+                recovery_body=f"target={self.foxya_ssh_user}@{self.foxya_ssh_host}\nstatus=ok",
+            )
+
+        failures = []
+        lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+        for line in lines:
+            parts = line.split()
+            if len(parts) < 2:
+                failures.append(f"unparseable={line}")
+                continue
+            name, status = parts[0], parts[1]
+            health = parts[2] if len(parts) > 2 else "no-healthcheck"
+            if status != "running":
+                failures.append(f"{name}=status:{status}")
+            elif health not in ("healthy", "no-healthcheck"):
+                failures.append(f"{name}=health:{health}")
+
+        body = "\n".join([
+            f"target={self.foxya_ssh_user}@{self.foxya_ssh_host}",
+            f"containers={','.join(self.foxya_docker_containers)}",
+            *lines,
+            *failures,
+        ])
+        return CheckResult(
+            ok=not failures,
+            title="[KORION] External Alert - Foxya Runtime Failed",
+            body=body,
+            recovery_title="[KORION] External Recovered - Foxya Runtime Failed",
+            recovery_body="\n".join([
+                f"target={self.foxya_ssh_user}@{self.foxya_ssh_host}",
+                "status=ok",
+                *lines,
+            ]),
+        )
+
+    def check_foxya_critical_logs(self) -> CheckResult:
+        if not self.foxya_critical_log_patterns:
+            return CheckResult(
+                ok=True,
+                title="[KORION] External Alert - Foxya Critical Logs",
+                body="status=disabled",
+                recovery_title="[KORION] External Recovered - Foxya Critical Logs",
+                recovery_body="status=disabled",
+            )
+
+        pattern = "|".join(f"({item})" for item in self.foxya_critical_log_patterns)
+        ignored_pattern = "|".join(f"({item})" for item in self.foxya_ignored_log_patterns)
+        if self.foxya_docker_check_mode == "socket":
+            try:
+                compiled_pattern = re.compile(pattern, re.IGNORECASE)
+                compiled_ignored = re.compile(ignored_pattern, re.IGNORECASE) if ignored_pattern else None
+                matched_lines = []
+                for name in self.foxya_log_containers:
+                    for line in self._docker_socket_container_logs(name).splitlines():
+                        if not compiled_pattern.search(line):
+                            continue
+                        if compiled_ignored and compiled_ignored.search(line):
+                            continue
+                        matched_lines.append(f"[{name}] {line}")
+            except Exception as exc:
+                return CheckResult(
+                    ok=False,
+                    title="[KORION] External Alert - Foxya Critical Logs",
+                    body=f"dockerSocket={self.foxya_docker_socket_path}\nerror={type(exc).__name__}: {exc}",
+                    recovery_title="[KORION] External Recovered - Foxya Critical Logs",
+                    recovery_body=f"dockerSocket={self.foxya_docker_socket_path}\nstatus=ok",
+                )
+
+            body_lines = [
+                f"dockerSocket={self.foxya_docker_socket_path}",
+                f"lookbackMinutes={self.foxya_log_lookback_minutes}",
+                f"containers={','.join(self.foxya_log_containers)}",
+            ] + matched_lines[-50:]
+            return CheckResult(
+                ok=not matched_lines,
+                title="[KORION] External Alert - Foxya Critical Logs",
+                body="\n".join(body_lines),
+                recovery_title="[KORION] External Recovered - Foxya Critical Logs",
+                recovery_body="\n".join(body_lines[:3] + ["status=no recent critical log pattern"]),
+            )
+
+        quoted_names = " ".join(shlex.quote(name) for name in self.foxya_log_containers)
+        remote_command = (
+            "for name in " + quoted_names + "; do "
+            f"sudo docker logs --since {self.foxya_log_lookback_minutes}m \"$name\" 2>&1 "
+            f"| grep -E -i {shlex.quote(pattern)} "
+        )
+        if ignored_pattern:
+            remote_command += f"| grep -E -i -v {shlex.quote(ignored_pattern)} "
+        remote_command += "| tail -n 20 | sed \"s/^/[$name] /\"; done"
+
+        try:
+            result = self._run_foxya_command(remote_command)
+        except Exception as exc:
+            return CheckResult(
+                ok=False,
+                title="[KORION] External Alert - Foxya Critical Logs",
+                body=f"target={self.foxya_ssh_user}@{self.foxya_ssh_host}\nerror={type(exc).__name__}: {exc}",
+                recovery_title="[KORION] External Recovered - Foxya Critical Logs",
+                recovery_body=f"target={self.foxya_ssh_user}@{self.foxya_ssh_host}\nstatus=ok",
+            )
+
+        matched_lines = [line for line in result.stdout.splitlines() if line.strip()]
+        body_lines = [
+            f"target={self.foxya_ssh_user}@{self.foxya_ssh_host}",
+            f"lookbackMinutes={self.foxya_log_lookback_minutes}",
+            f"containers={','.join(self.foxya_log_containers)}",
+        ] + matched_lines[-50:]
+        return CheckResult(
+            ok=not matched_lines,
+            title="[KORION] External Alert - Foxya Critical Logs",
+            body="\n".join(body_lines),
+            recovery_title="[KORION] External Recovered - Foxya Critical Logs",
+            recovery_body="\n".join(body_lines[:3] + ["status=no recent critical log pattern"]),
         )
 
 
