@@ -51,6 +51,8 @@ class CheckResult:
 
 
 class TelegramNotifier:
+    MAX_MESSAGE_LENGTH = 3900
+
     def __init__(self, token: str, chat_id: str) -> None:
         self.token = token
         self.chat_id = chat_id
@@ -61,15 +63,24 @@ class TelegramNotifier:
             print(f"[telegram-disabled] {title}\n{body}")
             return
 
-        requests.post(
-            f"https://api.telegram.org/bot{self.token}/sendMessage",
-            json={
-                "chat_id": self.chat_id,
-                "text": f"{title}\n{body}".strip(),
-                "disable_web_page_preview": True,
-            },
-            timeout=10,
-        ).raise_for_status()
+        text = f"{title}\n{body}".strip()
+        if len(text) > self.MAX_MESSAGE_LENGTH:
+            omitted = len(text) - self.MAX_MESSAGE_LENGTH
+            text = f"{text[:self.MAX_MESSAGE_LENGTH]}\n...[truncated {omitted} chars]"
+
+        try:
+            requests.post(
+                f"https://api.telegram.org/bot{self.token}/sendMessage",
+                json={
+                    "chat_id": self.chat_id,
+                    "text": text,
+                    "disable_web_page_preview": True,
+                },
+                timeout=10,
+            ).raise_for_status()
+        except requests.RequestException as exc:
+            status = getattr(getattr(exc, "response", None), "status_code", "unknown")
+            print(f"[telegram-send-failed] title={title!r} status={status} error={type(exc).__name__}")
 
 
 class Monitor:
@@ -105,11 +116,11 @@ class Monitor:
         self.foxya_ssh_timeout_seconds = env_int("FOXYA_SSH_TIMEOUT_SECONDS", 15)
         self.foxya_docker_containers = env_list(
             "FOXYA_DOCKER_CONTAINERS",
-            "foxya-coin-api,foxya-api-2,foxya-db-proxy,foxya-coin-postgres,foxya-coin-redis",
+            "foxya-api,foxya-api-2,foxya-db-proxy,foxya-postgres,foxya-redis",
         )
         self.foxya_log_containers = env_list(
             "FOXYA_LOG_CONTAINERS",
-            "foxya-coin-api,foxya-api-2,foxya-db-proxy",
+            "foxya-api,foxya-api-2,foxya-db-proxy",
         )
         self.foxya_log_lookback_minutes = env_int("FOXYA_LOG_LOOKBACK_MINUTES", 10)
         self.foxya_critical_log_patterns = env_list(
@@ -173,6 +184,80 @@ class Monitor:
             "OFFLINE_PAY_IGNORED_LOG_PATTERNS",
             "",
         )
+        self.coin_manage_runtime_check_enabled = env(
+            "COIN_MANAGE_RUNTIME_CHECK_ENABLED",
+            "false",
+        ).lower() == "true"
+        self.coin_manage_ssh_host = env("COIN_MANAGE_SSH_HOST", "54.83.183.123")
+        self.coin_manage_ssh_user = env("COIN_MANAGE_SSH_USER", "ubuntu")
+        self.coin_manage_ssh_port = env_int("COIN_MANAGE_SSH_PORT", 22)
+        self.coin_manage_ssh_key_path = env("COIN_MANAGE_SSH_KEY_PATH", self.offline_pay_ssh_key_path)
+        self.coin_manage_ssh_timeout_seconds = env_int("COIN_MANAGE_SSH_TIMEOUT_SECONDS", 15)
+        self.coin_manage_docker_containers = env_list(
+            "COIN_MANAGE_DOCKER_CONTAINERS",
+            "korion-app-api-1,korion-app-ops-1,korion-app-signer-1,korion-app-withdraw-worker-1,korion-postgres,korion-redis,ledger-signer",
+        )
+        self.coin_manage_log_containers = env_list(
+            "COIN_MANAGE_LOG_CONTAINERS",
+            "korion-app-api-1,korion-app-ops-1,korion-app-signer-1,korion-app-withdraw-worker-1,ledger-signer",
+        )
+        self.coin_manage_log_lookback_minutes = env_int("COIN_MANAGE_LOG_LOOKBACK_MINUTES", 10)
+        self.coin_manage_critical_log_patterns = env_list(
+            "COIN_MANAGE_CRITICAL_LOG_PATTERNS",
+            ",".join([
+                "ClosedConnectionException",
+                "Failed to read any response from the server",
+                "Connection is closed",
+                "connect ECONNREFUSED",
+                "Connection refused",
+                "Connection terminated unexpectedly",
+                "UnknownHostException",
+                "Failed to connect to Redis",
+                "Failed to start MainVerticle",
+                "dead.?letter",
+                "ledger_journals",
+                "settlement.*failed",
+                "collateral.*failed",
+                "withdraw.*failed",
+                "deposit.*failed",
+                "ERROR.*(ledger|settlement|collateral|withdraw|deposit|database|redis)",
+            ]),
+        )
+        self.coin_manage_ignored_log_patterns = env_list(
+            "COIN_MANAGE_IGNORED_LOG_PATTERNS",
+            "Unauthorized",
+        )
+        self.coin_csms_runtime_check_enabled = env(
+            "COIN_CSMS_RUNTIME_CHECK_ENABLED",
+            "false",
+        ).lower() == "true"
+        self.coin_csms_ssh_host = env("COIN_CSMS_SSH_HOST", self.foxya_ssh_host)
+        self.coin_csms_ssh_user = env("COIN_CSMS_SSH_USER", self.foxya_ssh_user)
+        self.coin_csms_ssh_port = env_int("COIN_CSMS_SSH_PORT", self.foxya_ssh_port)
+        self.coin_csms_ssh_key_path = env("COIN_CSMS_SSH_KEY_PATH", self.foxya_ssh_key_path or self.offline_pay_ssh_key_path)
+        self.coin_csms_ssh_timeout_seconds = env_int("COIN_CSMS_SSH_TIMEOUT_SECONDS", 15)
+        self.coin_csms_docker_containers = env_list("COIN_CSMS_DOCKER_CONTAINERS", "csms-api")
+        self.coin_csms_log_containers = env_list("COIN_CSMS_LOG_CONTAINERS", "csms-api")
+        self.coin_csms_log_lookback_minutes = env_int("COIN_CSMS_LOG_LOOKBACK_MINUTES", 10)
+        self.coin_csms_critical_log_patterns = env_list(
+            "COIN_CSMS_CRITICAL_LOG_PATTERNS",
+            ",".join([
+                "ClosedConnectionException",
+                "Failed to read any response from the server",
+                "Connection is closed",
+                "connect ECONNREFUSED",
+                "Connection refused",
+                "Connection terminated unexpectedly",
+                "UnknownHostException",
+                "Failed to connect to Redis",
+                "Failed to start",
+                "ERROR.*(admin|database|redis|foxya|coin_manage)",
+            ]),
+        )
+        self.coin_csms_ignored_log_patterns = env_list(
+            "COIN_CSMS_IGNORED_LOG_PATTERNS",
+            "Unauthorized",
+        )
 
     def _build_conninfo(self, prefix: str) -> str:
         return " ".join([
@@ -213,6 +298,10 @@ class Monitor:
                     f"foxyaSshHost={self.foxya_ssh_host}",
                     f"offlinePayRuntimeCheckEnabled={self.offline_pay_runtime_check_enabled}",
                     f"offlinePaySshHost={self.offline_pay_ssh_host}",
+                    f"coinManageRuntimeCheckEnabled={self.coin_manage_runtime_check_enabled}",
+                    f"coinManageSshHost={self.coin_manage_ssh_host}",
+                    f"coinCsmsRuntimeCheckEnabled={self.coin_csms_runtime_check_enabled}",
+                    f"coinCsmsSshHost={self.coin_csms_ssh_host}",
                 ]),
             )
 
@@ -228,6 +317,12 @@ class Monitor:
             checks["foxya_critical_logs"] = self.check_foxya_critical_logs
         if self.offline_pay_runtime_check_enabled:
             checks["offline_pay_critical_logs"] = self.check_offline_pay_critical_logs
+        if self.coin_manage_runtime_check_enabled:
+            checks["coin_manage_runtime"] = self.check_coin_manage_runtime
+            checks["coin_manage_critical_logs"] = self.check_coin_manage_critical_logs
+        if self.coin_csms_runtime_check_enabled:
+            checks["coin_csms_runtime"] = self.check_coin_csms_runtime
+            checks["coin_csms_critical_logs"] = self.check_coin_csms_critical_logs
 
         while True:
             for key, check in checks.items():
@@ -764,6 +859,224 @@ class Monitor:
             body="\n".join(body_lines),
             recovery_title="[KORION] External Recovered - Offline Pay Critical Logs",
             recovery_body="\n".join(body_lines[:3] + ["status=no recent critical log pattern"]),
+        )
+
+    def _check_ssh_docker_runtime(
+        self,
+        *,
+        service_name: str,
+        alert_name: str,
+        user: str,
+        host: str,
+        port: int,
+        key_path: str,
+        timeout_seconds: int,
+        containers: list[str],
+    ) -> CheckResult:
+        quoted_names = " ".join(shlex.quote(name) for name in containers)
+        remote_command = (
+            "for name in " + quoted_names + "; do "
+            "status=$(sudo docker inspect -f '{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{else}}no-healthcheck{{end}}' \"$name\" 2>/dev/null) || "
+            "status=missing; "
+            "echo \"$name $status\"; "
+            "done"
+        )
+        try:
+            result = self._ssh_command(
+                user=user,
+                host=host,
+                port=port,
+                key_path=key_path,
+                timeout_seconds=timeout_seconds,
+                remote_command=remote_command,
+            )
+        except Exception as exc:
+            return CheckResult(
+                ok=False,
+                title=f"[KORION] External Alert - {alert_name} Runtime Failed",
+                body=f"service={service_name}\ntarget={user}@{host}\nerror={type(exc).__name__}: {exc}",
+                recovery_title=f"[KORION] External Recovered - {alert_name} Runtime Failed",
+                recovery_body=f"service={service_name}\ntarget={user}@{host}\nstatus=ok",
+            )
+
+        if result.returncode != 0:
+            return CheckResult(
+                ok=False,
+                title=f"[KORION] External Alert - {alert_name} Runtime Failed",
+                body=f"service={service_name}\ntarget={user}@{host}\nssh_exit={result.returncode}\nstderr={result.stderr.strip()}",
+                recovery_title=f"[KORION] External Recovered - {alert_name} Runtime Failed",
+                recovery_body=f"service={service_name}\ntarget={user}@{host}\nstatus=ok",
+            )
+
+        failures = []
+        lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+        for line in lines:
+            parts = line.split()
+            if len(parts) < 2:
+                failures.append(f"unparseable={line}")
+                continue
+            name, status = parts[0], parts[1]
+            health = parts[2] if len(parts) > 2 else "no-healthcheck"
+            if status != "running":
+                failures.append(f"{name}=status:{status}")
+            elif health not in ("healthy", "no-healthcheck"):
+                failures.append(f"{name}=health:{health}")
+
+        body = "\n".join([
+            f"service={service_name}",
+            f"target={user}@{host}",
+            f"containers={','.join(containers)}",
+            *lines,
+            *failures,
+        ])
+        return CheckResult(
+            ok=not failures,
+            title=f"[KORION] External Alert - {alert_name} Runtime Failed",
+            body=body,
+            recovery_title=f"[KORION] External Recovered - {alert_name} Runtime Failed",
+            recovery_body="\n".join([
+                f"service={service_name}",
+                f"target={user}@{host}",
+                "status=ok",
+                *lines,
+            ]),
+        )
+
+    def _check_ssh_docker_critical_logs(
+        self,
+        *,
+        service_name: str,
+        alert_name: str,
+        user: str,
+        host: str,
+        port: int,
+        key_path: str,
+        timeout_seconds: int,
+        containers: list[str],
+        lookback_minutes: int,
+        critical_patterns: list[str],
+        ignored_patterns: list[str],
+    ) -> CheckResult:
+        if not critical_patterns:
+            return CheckResult(
+                ok=True,
+                title=f"[KORION] External Alert - {alert_name} Critical Logs",
+                body="status=disabled",
+                recovery_title=f"[KORION] External Recovered - {alert_name} Critical Logs",
+                recovery_body="status=disabled",
+            )
+
+        pattern = "|".join(f"({item})" for item in critical_patterns)
+        ignored_pattern = "|".join(f"({item})" for item in ignored_patterns)
+        quoted_names = " ".join(shlex.quote(name) for name in containers)
+        remote_command = (
+            "for name in " + quoted_names + "; do "
+            f"sudo docker logs --since {lookback_minutes}m \"$name\" 2>&1 "
+            f"| grep -E -i {shlex.quote(pattern)} "
+        )
+        if ignored_pattern:
+            remote_command += f"| grep -E -i -v {shlex.quote(ignored_pattern)} "
+        remote_command += "| tail -n 20 | sed \"s/^/[$name] /\"; done"
+
+        try:
+            result = self._ssh_command(
+                user=user,
+                host=host,
+                port=port,
+                key_path=key_path,
+                timeout_seconds=timeout_seconds,
+                remote_command=remote_command,
+            )
+        except Exception as exc:
+            return CheckResult(
+                ok=False,
+                title=f"[KORION] External Alert - {alert_name} Critical Logs",
+                body=f"service={service_name}\ntarget={user}@{host}\nerror={type(exc).__name__}: {exc}",
+                recovery_title=f"[KORION] External Recovered - {alert_name} Critical Logs",
+                recovery_body=f"service={service_name}\ntarget={user}@{host}\nstatus=ok",
+            )
+
+        if result.returncode not in (0, 1):
+            return CheckResult(
+                ok=False,
+                title=f"[KORION] External Alert - {alert_name} Critical Logs",
+                body="\n".join([
+                    f"service={service_name}",
+                    f"target={user}@{host}",
+                    f"ssh_exit={result.returncode}",
+                    f"stderr={result.stderr.strip()}",
+                ]),
+                recovery_title=f"[KORION] External Recovered - {alert_name} Critical Logs",
+                recovery_body=f"service={service_name}\ntarget={user}@{host}\nstatus=ok",
+            )
+
+        matched_lines = [line for line in result.stdout.splitlines() if line.strip()]
+        body_lines = [
+            f"service={service_name}",
+            f"target={user}@{host}",
+            f"lookbackMinutes={lookback_minutes}",
+            f"containers={','.join(containers)}",
+        ] + matched_lines[-50:]
+        return CheckResult(
+            ok=not matched_lines,
+            title=f"[KORION] External Alert - {alert_name} Critical Logs",
+            body="\n".join(body_lines),
+            recovery_title=f"[KORION] External Recovered - {alert_name} Critical Logs",
+            recovery_body="\n".join(body_lines[:4] + ["status=no recent critical log pattern"]),
+        )
+
+    def check_coin_manage_runtime(self) -> CheckResult:
+        return self._check_ssh_docker_runtime(
+            service_name="coin_manage",
+            alert_name="Coin Manage",
+            user=self.coin_manage_ssh_user,
+            host=self.coin_manage_ssh_host,
+            port=self.coin_manage_ssh_port,
+            key_path=self.coin_manage_ssh_key_path,
+            timeout_seconds=self.coin_manage_ssh_timeout_seconds,
+            containers=self.coin_manage_docker_containers,
+        )
+
+    def check_coin_manage_critical_logs(self) -> CheckResult:
+        return self._check_ssh_docker_critical_logs(
+            service_name="coin_manage",
+            alert_name="Coin Manage",
+            user=self.coin_manage_ssh_user,
+            host=self.coin_manage_ssh_host,
+            port=self.coin_manage_ssh_port,
+            key_path=self.coin_manage_ssh_key_path,
+            timeout_seconds=self.coin_manage_ssh_timeout_seconds,
+            containers=self.coin_manage_log_containers,
+            lookback_minutes=self.coin_manage_log_lookback_minutes,
+            critical_patterns=self.coin_manage_critical_log_patterns,
+            ignored_patterns=self.coin_manage_ignored_log_patterns,
+        )
+
+    def check_coin_csms_runtime(self) -> CheckResult:
+        return self._check_ssh_docker_runtime(
+            service_name="coin_csms",
+            alert_name="Coin CSMS",
+            user=self.coin_csms_ssh_user,
+            host=self.coin_csms_ssh_host,
+            port=self.coin_csms_ssh_port,
+            key_path=self.coin_csms_ssh_key_path,
+            timeout_seconds=self.coin_csms_ssh_timeout_seconds,
+            containers=self.coin_csms_docker_containers,
+        )
+
+    def check_coin_csms_critical_logs(self) -> CheckResult:
+        return self._check_ssh_docker_critical_logs(
+            service_name="coin_csms",
+            alert_name="Coin CSMS",
+            user=self.coin_csms_ssh_user,
+            host=self.coin_csms_ssh_host,
+            port=self.coin_csms_ssh_port,
+            key_path=self.coin_csms_ssh_key_path,
+            timeout_seconds=self.coin_csms_ssh_timeout_seconds,
+            containers=self.coin_csms_log_containers,
+            lookback_minutes=self.coin_csms_log_lookback_minutes,
+            critical_patterns=self.coin_csms_critical_log_patterns,
+            ignored_patterns=self.coin_csms_ignored_log_patterns,
         )
 
 
