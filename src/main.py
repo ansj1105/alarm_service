@@ -131,6 +131,10 @@ class Monitor:
         self.foxya_ssh_port = env_int("FOXYA_SSH_PORT", 22)
         self.foxya_ssh_key_path = env("FOXYA_SSH_KEY_PATH", "")
         self.foxya_ssh_timeout_seconds = env_int("FOXYA_SSH_TIMEOUT_SECONDS", 15)
+        self.foxya_docker_socket_timeout_seconds = env_int(
+            "FOXYA_DOCKER_SOCKET_TIMEOUT_SECONDS",
+            self.foxya_ssh_timeout_seconds,
+        )
         self.foxya_docker_containers = env_list(
             "FOXYA_DOCKER_CONTAINERS",
             "foxya-api,foxya-api-2,foxya-db-proxy,foxya-postgres,foxya-redis",
@@ -140,6 +144,7 @@ class Monitor:
             "foxya-api,foxya-api-2,foxya-db-proxy",
         )
         self.foxya_log_lookback_minutes = env_int("FOXYA_LOG_LOOKBACK_MINUTES", 10)
+        self.foxya_log_tail_lines = env_int("FOXYA_LOG_TAIL_LINES", 300)
         self.foxya_critical_log_patterns = env_list(
             "FOXYA_CRITICAL_LOG_PATTERNS",
             ",".join([
@@ -679,15 +684,29 @@ class Monitor:
                 self.sock.settimeout(self.timeout)
                 self.sock.connect(self.socket_path)
 
-        connection = UnixSocketHTTPConnection(self.foxya_docker_socket_path, self.foxya_ssh_timeout_seconds)
-        try:
-            body = json.dumps(payload).encode("utf-8") if payload is not None else None
-            headers = {"Content-Type": "application/json"} if payload is not None else {}
-            connection.request(method, path, body=body, headers=headers)
-            response = connection.getresponse()
-            return response.status, response.read()
-        finally:
-            connection.close()
+        body = json.dumps(payload).encode("utf-8") if payload is not None else None
+        headers = {"Content-Type": "application/json"} if payload is not None else {}
+        last_error: Optional[BaseException] = None
+        for attempt in range(2):
+            connection = UnixSocketHTTPConnection(
+                self.foxya_docker_socket_path,
+                self.foxya_docker_socket_timeout_seconds,
+            )
+            try:
+                connection.request(method, path, body=body, headers=headers)
+                response = connection.getresponse()
+                return response.status, response.read()
+            except (TimeoutError, socket.timeout, OSError) as exc:
+                last_error = exc
+                if attempt == 0:
+                    time.sleep(0.5)
+                    continue
+                raise
+            finally:
+                connection.close()
+        if last_error:
+            raise last_error
+        raise RuntimeError("docker socket request failed without response")
 
     def _docker_socket_container_status(self, name: str) -> tuple[str, str]:
         status, body = self._docker_socket_request(f"/containers/{name}/json")
@@ -703,7 +722,7 @@ class Monitor:
     def _docker_socket_container_logs(self, name: str) -> str:
         since = max(0, int(time.time()) - self.foxya_log_lookback_minutes * 60)
         status, body = self._docker_socket_request(
-            f"/containers/{name}/logs?stdout=1&stderr=1&timestamps=1&since={since}"
+            f"/containers/{name}/logs?stdout=1&stderr=1&timestamps=1&since={since}&tail={self.foxya_log_tail_lines}"
         )
         if status < 200 or status >= 300:
             return f"docker_socket_log_error status={status}"

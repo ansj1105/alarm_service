@@ -15,6 +15,7 @@ Fox Coin 외부 감시용 텔레그램 알림 서비스입니다.
   - Redis 메모리 사용률 임계치 초과 알림
 - 예: `ClosedConnectionException`, `Failed to read any response from the server`, `Connection refused: db-proxy`, `connect ECONNREFUSED`, `Connection terminated unexpectedly`, `UnknownHostException`, `Failed to resolve 'redis'`, `backend-unresolved`, `runtime-conflict`, `postgres.*NOSRV`
 - Foxya 가격 워커의 일시적 DB backoff 로그(`Coin price scheduled refresh ...`)는 기본 ignore 처리합니다. 다른 API 경로의 DB 응답 끊김은 계속 감지합니다.
+- Docker socket 로그 조회는 1회 재시도하며, 기본 `tail=300`으로 제한해 로그량 때문에 모니터 자체가 timeout 알림을 내지 않도록 합니다.
 - 선택형 `offline_pay` SSH 로그 상태
   - settlement/collateral dead-letter, 담보 부족, receiver history sync, Foxya/coin_manage 5xx 연동 실패 패턴
   - 예: `Offline Pay Settlement Dead Letter`, `offline_pay.collateral.dead_letter`, `COLLATERAL_LOCK_FAIL`, `INSUFFICIENT_BALANCE`, `Failed to request settlement`, `HISTORY_SYNC_FAIL`
@@ -38,6 +39,8 @@ FOXYA_RUNTIME_CHECK_ENABLED=true
 FOXYA_DOCKER_CHECK_MODE=socket
 FOXYA_DOCKER_CONTAINERS=foxya-api,foxya-api-2,foxya-db-proxy,foxya-postgres,foxya-redis
 FOXYA_LOG_CONTAINERS=foxya-api,foxya-api-2,foxya-db-proxy
+FOXYA_DOCKER_SOCKET_TIMEOUT_SECONDS=15
+FOXYA_LOG_TAIL_LINES=300
 FOXYA_REDIS_MEMORY_CHECK_ENABLED=true
 FOXYA_REDIS_CONTAINERS=foxya-redis
 ```
