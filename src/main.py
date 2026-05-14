@@ -30,6 +30,20 @@ def env_int(name: str, default: int) -> int:
         return default
 
 
+def env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+
+
+def env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.lower() == "true"
+
+
 def env_list(name: str, default: str) -> list[str]:
     value = os.getenv(name, default)
     return [item.strip() for item in value.split(",") if item.strip()]
@@ -95,6 +109,8 @@ class Monitor:
         self.db_catalog_probe_sql = env("DB_CATALOG_PROBE_SQL", "SELECT 1 FROM pg_catalog.pg_statistic LIMIT 1")
         self.notifier = TelegramNotifier(env("TELEGRAM_BOT_TOKEN", ""), env("TELEGRAM_CHAT_ID", ""))
         self.states: Dict[str, AlertState] = {}
+        self.redis_memory_usage_threshold_percent = env_float("REDIS_MEMORY_USAGE_THRESHOLD_PERCENT", 80.0)
+        self.redis_memory_fail_on_unbounded = env_bool("REDIS_MEMORY_FAIL_ON_UNBOUNDED", False)
 
         self.primary_conninfo = self._build_conninfo("PRIMARY_DB")
         self.primary_db_target = self._build_target("PRIMARY_DB")
@@ -149,6 +165,8 @@ class Monitor:
             "FOXYA_IGNORED_LOG_PATTERNS",
             "Unauthorized,프로필 이미지를 찾을 수 없습니다,NoStackTraceThrowable: Connection is closed",
         )
+        self.foxya_redis_memory_check_enabled = env_bool("FOXYA_REDIS_MEMORY_CHECK_ENABLED", False)
+        self.foxya_redis_containers = env_list("FOXYA_REDIS_CONTAINERS", "foxya-redis")
         self.offline_pay_runtime_check_enabled = env(
             "OFFLINE_PAY_RUNTIME_CHECK_ENABLED",
             "false",
@@ -184,6 +202,8 @@ class Monitor:
             "OFFLINE_PAY_IGNORED_LOG_PATTERNS",
             "",
         )
+        self.offline_pay_redis_memory_check_enabled = env_bool("OFFLINE_PAY_REDIS_MEMORY_CHECK_ENABLED", False)
+        self.offline_pay_redis_containers = env_list("OFFLINE_PAY_REDIS_CONTAINERS", "korion_offline-redis-1")
         self.coin_manage_runtime_check_enabled = env(
             "COIN_MANAGE_RUNTIME_CHECK_ENABLED",
             "false",
@@ -227,6 +247,8 @@ class Monitor:
             "COIN_MANAGE_IGNORED_LOG_PATTERNS",
             "Unauthorized",
         )
+        self.coin_manage_redis_memory_check_enabled = env_bool("COIN_MANAGE_REDIS_MEMORY_CHECK_ENABLED", False)
+        self.coin_manage_redis_containers = env_list("COIN_MANAGE_REDIS_CONTAINERS", "korion-redis")
         self.coin_csms_runtime_check_enabled = env(
             "COIN_CSMS_RUNTIME_CHECK_ENABLED",
             "false",
@@ -258,6 +280,8 @@ class Monitor:
             "COIN_CSMS_IGNORED_LOG_PATTERNS",
             "Unauthorized",
         )
+        self.coin_csms_redis_memory_check_enabled = env_bool("COIN_CSMS_REDIS_MEMORY_CHECK_ENABLED", False)
+        self.coin_csms_redis_containers = env_list("COIN_CSMS_REDIS_CONTAINERS", "")
 
     def _build_conninfo(self, prefix: str) -> str:
         return " ".join([
@@ -293,15 +317,20 @@ class Monitor:
                     f"standbyDb={self.standby_db_target}",
                     f"criticalProbeSql={self.db_critical_probe_sql}",
                     f"catalogProbeSql={self.db_catalog_probe_sql}",
+                    f"redisMemoryUsageThresholdPercent={self.redis_memory_usage_threshold_percent}",
                     f"foxyaRuntimeCheckEnabled={self.foxya_runtime_check_enabled}",
                     f"foxyaDockerCheckMode={self.foxya_docker_check_mode}",
                     f"foxyaSshHost={self.foxya_ssh_host}",
+                    f"foxyaRedisMemoryCheckEnabled={self.foxya_redis_memory_check_enabled}",
                     f"offlinePayRuntimeCheckEnabled={self.offline_pay_runtime_check_enabled}",
                     f"offlinePaySshHost={self.offline_pay_ssh_host}",
+                    f"offlinePayRedisMemoryCheckEnabled={self.offline_pay_redis_memory_check_enabled}",
                     f"coinManageRuntimeCheckEnabled={self.coin_manage_runtime_check_enabled}",
                     f"coinManageSshHost={self.coin_manage_ssh_host}",
+                    f"coinManageRedisMemoryCheckEnabled={self.coin_manage_redis_memory_check_enabled}",
                     f"coinCsmsRuntimeCheckEnabled={self.coin_csms_runtime_check_enabled}",
                     f"coinCsmsSshHost={self.coin_csms_ssh_host}",
+                    f"coinCsmsRedisMemoryCheckEnabled={self.coin_csms_redis_memory_check_enabled}",
                 ]),
             )
 
@@ -315,14 +344,22 @@ class Monitor:
         if self.foxya_runtime_check_enabled:
             checks["foxya_runtime"] = self.check_foxya_runtime
             checks["foxya_critical_logs"] = self.check_foxya_critical_logs
+        if self.foxya_redis_memory_check_enabled:
+            checks["foxya_redis_memory"] = self.check_foxya_redis_memory
         if self.offline_pay_runtime_check_enabled:
             checks["offline_pay_critical_logs"] = self.check_offline_pay_critical_logs
+        if self.offline_pay_redis_memory_check_enabled:
+            checks["offline_pay_redis_memory"] = self.check_offline_pay_redis_memory
         if self.coin_manage_runtime_check_enabled:
             checks["coin_manage_runtime"] = self.check_coin_manage_runtime
             checks["coin_manage_critical_logs"] = self.check_coin_manage_critical_logs
+        if self.coin_manage_redis_memory_check_enabled:
+            checks["coin_manage_redis_memory"] = self.check_coin_manage_redis_memory
         if self.coin_csms_runtime_check_enabled:
             checks["coin_csms_runtime"] = self.check_coin_csms_runtime
             checks["coin_csms_critical_logs"] = self.check_coin_csms_critical_logs
+        if self.coin_csms_redis_memory_check_enabled:
+            checks["coin_csms_redis_memory"] = self.check_coin_csms_redis_memory
 
         while True:
             for key, check in checks.items():
@@ -989,6 +1026,160 @@ class Monitor:
             ]),
         )
 
+    def _check_ssh_redis_memory(
+        self,
+        *,
+        service_name: str,
+        alert_name: str,
+        user: str,
+        host: str,
+        port: int,
+        key_path: str,
+        timeout_seconds: int,
+        containers: list[str],
+    ) -> CheckResult:
+        if not containers:
+            return CheckResult(
+                ok=True,
+                title=f"[KORION] External Alert - {alert_name} Redis Memory",
+                body="status=disabled",
+                recovery_title=f"[KORION] External Recovered - {alert_name} Redis Memory",
+                recovery_body="status=disabled",
+            )
+
+        quoted_names = " ".join(shlex.quote(name) for name in containers)
+        remote_command = (
+            "for name in " + quoted_names + "; do "
+            "if ! sudo docker inspect \"$name\" >/dev/null 2>&1; then "
+            "echo \"$name status=missing\"; continue; "
+            "fi; "
+            "info=$(sudo docker exec \"$name\" redis-cli INFO memory 2>&1) || { "
+            "err=$(printf '%s' \"$info\" | tr '\\n ' '__' | head -c 160); "
+            "echo \"$name status=error error=${err:-redis-cli_failed}\"; continue; "
+            "}; "
+            "used=$(printf '%s\\n' \"$info\" | awk -F: '$1==\"used_memory\" {gsub(/\\r/,\"\",$2); print $2; exit}'); "
+            "max=$(printf '%s\\n' \"$info\" | awk -F: '$1==\"maxmemory\" {gsub(/\\r/,\"\",$2); print $2; exit}'); "
+            "frag=$(printf '%s\\n' \"$info\" | awk -F: '$1==\"mem_fragmentation_ratio\" {gsub(/\\r/,\"\",$2); print $2; exit}'); "
+            "limit=$(sudo docker inspect -f '{{.HostConfig.Memory}}' \"$name\" 2>/dev/null || echo 0); "
+            "host_memory=$(awk '/MemTotal/ {printf \"%.0f\", $2 * 1024}' /proc/meminfo 2>/dev/null || echo 0); "
+            "echo \"$name status=ok used_memory=${used:-0} maxmemory=${max:-0} container_limit=${limit:-0} host_memory=${host_memory:-0} mem_fragmentation_ratio=${frag:-unknown}\"; "
+            "done"
+        )
+        try:
+            result = self._ssh_command(
+                user=user,
+                host=host,
+                port=port,
+                key_path=key_path,
+                timeout_seconds=timeout_seconds,
+                remote_command=remote_command,
+            )
+        except Exception as exc:
+            return CheckResult(
+                ok=False,
+                title=f"[KORION] External Alert - {alert_name} Redis Memory",
+                body=f"service={service_name}\ntarget={user}@{host}\nerror={type(exc).__name__}: {exc}",
+                recovery_title=f"[KORION] External Recovered - {alert_name} Redis Memory",
+                recovery_body=f"service={service_name}\ntarget={user}@{host}\nstatus=ok",
+            )
+
+        if result.returncode != 0:
+            return CheckResult(
+                ok=False,
+                title=f"[KORION] External Alert - {alert_name} Redis Memory",
+                body=f"service={service_name}\ntarget={user}@{host}\nssh_exit={result.returncode}\nstderr={result.stderr.strip()}",
+                recovery_title=f"[KORION] External Recovered - {alert_name} Redis Memory",
+                recovery_body=f"service={service_name}\ntarget={user}@{host}\nstatus=ok",
+            )
+
+        threshold = self.redis_memory_usage_threshold_percent
+        failures = []
+        lines = []
+        for line in [item.strip() for item in result.stdout.splitlines() if item.strip()]:
+            parts = line.split()
+            if len(parts) < 2:
+                failures.append(f"unparseable={line}")
+                lines.append(line)
+                continue
+
+            container = parts[0]
+            metrics = {}
+            for part in parts[1:]:
+                key, separator, value = part.partition("=")
+                if separator:
+                    metrics[key] = value
+
+            status = metrics.get("status", "unknown")
+            if status != "ok":
+                lines.append(line)
+                failures.append(f"{container}=status:{status}")
+                continue
+
+            used_memory = self._parse_int(metrics.get("used_memory"))
+            maxmemory = self._parse_int(metrics.get("maxmemory"))
+            container_limit = self._parse_int(metrics.get("container_limit"))
+            host_memory = self._parse_int(metrics.get("host_memory"))
+            denominator = maxmemory if maxmemory > 0 else container_limit if container_limit > 0 else host_memory
+            basis = (
+                "maxmemory"
+                if maxmemory > 0
+                else "container_limit"
+                if container_limit > 0
+                else "host_memory"
+                if host_memory > 0
+                else "unbounded"
+            )
+
+            if denominator <= 0:
+                usage_text = "usagePercent=unknown"
+                if self.redis_memory_fail_on_unbounded:
+                    failures.append(f"{container}=redis_memory_unbounded")
+            else:
+                usage_percent = used_memory / denominator * 100
+                usage_text = f"usagePercent={usage_percent:.2f}"
+                if usage_percent >= threshold:
+                    failures.append(f"{container}=redis_memory:{usage_percent:.2f}%")
+
+            lines.append(" ".join([
+                f"{container}",
+                f"status=ok",
+                f"usedMemory={used_memory}",
+                f"limit={denominator}",
+                f"basis={basis}",
+                usage_text,
+                f"thresholdPercent={threshold:.2f}",
+                f"memFragmentationRatio={metrics.get('mem_fragmentation_ratio', 'unknown')}",
+            ]))
+
+        body = "\n".join([
+            f"service={service_name}",
+            f"target={user}@{host}",
+            f"containers={','.join(containers)}",
+            f"thresholdPercent={threshold:.2f}",
+            *lines,
+            *failures,
+        ])
+        return CheckResult(
+            ok=not failures,
+            title=f"[KORION] External Alert - {alert_name} Redis Memory",
+            body=body,
+            recovery_title=f"[KORION] External Recovered - {alert_name} Redis Memory",
+            recovery_body="\n".join([
+                f"service={service_name}",
+                f"target={user}@{host}",
+                "status=ok",
+                *lines,
+            ]),
+        )
+
+    def _parse_int(self, value: Optional[str]) -> int:
+        if value is None:
+            return 0
+        try:
+            return int(value)
+        except ValueError:
+            return 0
+
     def _check_ssh_docker_critical_logs(
         self,
         *,
@@ -1099,6 +1290,42 @@ class Monitor:
             ignored_patterns=self.coin_manage_ignored_log_patterns,
         )
 
+    def check_foxya_redis_memory(self) -> CheckResult:
+        return self._check_ssh_redis_memory(
+            service_name="foxya",
+            alert_name="Foxya",
+            user=self.foxya_ssh_user,
+            host=self.foxya_ssh_host,
+            port=self.foxya_ssh_port,
+            key_path=self.foxya_ssh_key_path,
+            timeout_seconds=self.foxya_ssh_timeout_seconds,
+            containers=self.foxya_redis_containers,
+        )
+
+    def check_offline_pay_redis_memory(self) -> CheckResult:
+        return self._check_ssh_redis_memory(
+            service_name="offline_pay",
+            alert_name="Offline Pay",
+            user=self.offline_pay_ssh_user,
+            host=self.offline_pay_ssh_host,
+            port=self.offline_pay_ssh_port,
+            key_path=self.offline_pay_ssh_key_path,
+            timeout_seconds=self.offline_pay_ssh_timeout_seconds,
+            containers=self.offline_pay_redis_containers,
+        )
+
+    def check_coin_manage_redis_memory(self) -> CheckResult:
+        return self._check_ssh_redis_memory(
+            service_name="coin_manage",
+            alert_name="Coin Manage",
+            user=self.coin_manage_ssh_user,
+            host=self.coin_manage_ssh_host,
+            port=self.coin_manage_ssh_port,
+            key_path=self.coin_manage_ssh_key_path,
+            timeout_seconds=self.coin_manage_ssh_timeout_seconds,
+            containers=self.coin_manage_redis_containers,
+        )
+
     def check_coin_csms_runtime(self) -> CheckResult:
         return self._check_ssh_docker_runtime(
             service_name="coin_csms",
@@ -1124,6 +1351,18 @@ class Monitor:
             lookback_minutes=self.coin_csms_log_lookback_minutes,
             critical_patterns=self.coin_csms_critical_log_patterns,
             ignored_patterns=self.coin_csms_ignored_log_patterns,
+        )
+
+    def check_coin_csms_redis_memory(self) -> CheckResult:
+        return self._check_ssh_redis_memory(
+            service_name="coin_csms",
+            alert_name="Coin CSMS",
+            user=self.coin_csms_ssh_user,
+            host=self.coin_csms_ssh_host,
+            port=self.coin_csms_ssh_port,
+            key_path=self.coin_csms_ssh_key_path,
+            timeout_seconds=self.coin_csms_ssh_timeout_seconds,
+            containers=self.coin_csms_redis_containers,
         )
 
 
