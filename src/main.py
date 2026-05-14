@@ -163,7 +163,12 @@ class Monitor:
         )
         self.foxya_ignored_log_patterns = env_list(
             "FOXYA_IGNORED_LOG_PATTERNS",
-            "Unauthorized,프로필 이미지를 찾을 수 없습니다,NoStackTraceThrowable: Connection is closed",
+            ",".join([
+                "Unauthorized",
+                "프로필 이미지를 찾을 수 없습니다",
+                "NoStackTraceThrowable: Connection is closed",
+                "Coin price scheduled refresh",
+            ]),
         )
         self.foxya_redis_memory_check_enabled = env_bool("FOXYA_REDIS_MEMORY_CHECK_ENABLED", False)
         self.foxya_redis_containers = env_list("FOXYA_REDIS_CONTAINERS", "foxya-redis")
