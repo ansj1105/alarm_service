@@ -658,7 +658,12 @@ class Monitor:
             )
         return None
 
-    def _docker_socket_request(self, path: str) -> tuple[int, bytes]:
+    def _docker_socket_request(
+        self,
+        path: str,
+        method: str = "GET",
+        payload: Optional[dict] = None,
+    ) -> tuple[int, bytes]:
         class UnixSocketHTTPConnection(http.client.HTTPConnection):
             def __init__(self, socket_path: str, timeout: int) -> None:
                 super().__init__("localhost", timeout=timeout)
@@ -671,7 +676,9 @@ class Monitor:
 
         connection = UnixSocketHTTPConnection(self.foxya_docker_socket_path, self.foxya_ssh_timeout_seconds)
         try:
-            connection.request("GET", path)
+            body = json.dumps(payload).encode("utf-8") if payload is not None else None
+            headers = {"Content-Type": "application/json"} if payload is not None else {}
+            connection.request(method, path, body=body, headers=headers)
             response = connection.getresponse()
             return response.status, response.read()
         finally:
@@ -696,6 +703,52 @@ class Monitor:
         if status < 200 or status >= 300:
             return f"docker_socket_log_error status={status}"
         return body.decode("utf-8", errors="replace")
+
+    def _docker_socket_container_memory_limit(self, name: str) -> int:
+        status, body = self._docker_socket_request(f"/containers/{name}/json")
+        if status < 200 or status >= 300:
+            return 0
+        payload = json.loads(body.decode("utf-8"))
+        return self._parse_int(str(((payload.get("HostConfig") or {}).get("Memory") or 0)))
+
+    def _docker_socket_exec(self, name: str, command: list[str]) -> tuple[int, str]:
+        status, body = self._docker_socket_request(
+            f"/containers/{name}/exec",
+            method="POST",
+            payload={
+                "AttachStdout": True,
+                "AttachStderr": True,
+                "Tty": False,
+                "Cmd": command,
+            },
+        )
+        if status < 200 or status >= 300:
+            return status, body.decode("utf-8", errors="replace")
+
+        exec_id = json.loads(body.decode("utf-8")).get("Id")
+        if not exec_id:
+            return 500, "missing exec id"
+
+        status, body = self._docker_socket_request(
+            f"/exec/{exec_id}/start",
+            method="POST",
+            payload={"Detach": False, "Tty": False},
+        )
+        if status < 200 or status >= 300:
+            return status, body.decode("utf-8", errors="replace")
+        return status, self._decode_docker_multiplexed(body)
+
+    def _decode_docker_multiplexed(self, payload: bytes) -> str:
+        chunks = []
+        index = 0
+        while index + 8 <= len(payload):
+            size = int.from_bytes(payload[index + 4:index + 8], byteorder="big")
+            index += 8
+            chunks.append(payload[index:index + size])
+            index += size
+        if not chunks:
+            chunks.append(payload)
+        return b"".join(chunks).decode("utf-8", errors="replace")
 
     def check_foxya_runtime(self) -> CheckResult:
         if self.foxya_docker_check_mode == "socket":
@@ -1092,10 +1145,27 @@ class Monitor:
                 recovery_body=f"service={service_name}\ntarget={user}@{host}\nstatus=ok",
             )
 
+        return self._redis_memory_result_from_lines(
+            service_name=service_name,
+            alert_name=alert_name,
+            target=f"{user}@{host}",
+            containers=containers,
+            raw_lines=result.stdout.splitlines(),
+        )
+
+    def _redis_memory_result_from_lines(
+        self,
+        *,
+        service_name: str,
+        alert_name: str,
+        target: str,
+        containers: list[str],
+        raw_lines: list[str],
+    ) -> CheckResult:
         threshold = self.redis_memory_usage_threshold_percent
         failures = []
         lines = []
-        for line in [item.strip() for item in result.stdout.splitlines() if item.strip()]:
+        for line in [item.strip() for item in raw_lines if item.strip()]:
             parts = line.split()
             if len(parts) < 2:
                 failures.append(f"unparseable={line}")
@@ -1153,7 +1223,7 @@ class Monitor:
 
         body = "\n".join([
             f"service={service_name}",
-            f"target={user}@{host}",
+            f"target={target}",
             f"containers={','.join(containers)}",
             f"thresholdPercent={threshold:.2f}",
             *lines,
@@ -1166,7 +1236,7 @@ class Monitor:
             recovery_title=f"[KORION] External Recovered - {alert_name} Redis Memory",
             recovery_body="\n".join([
                 f"service={service_name}",
-                f"target={user}@{host}",
+                f"target={target}",
                 "status=ok",
                 *lines,
             ]),
@@ -1179,6 +1249,65 @@ class Monitor:
             return int(value)
         except ValueError:
             return 0
+
+    def _check_docker_socket_redis_memory(
+        self,
+        *,
+        service_name: str,
+        alert_name: str,
+        containers: list[str],
+    ) -> CheckResult:
+        if not containers:
+            return CheckResult(
+                ok=True,
+                title=f"[KORION] External Alert - {alert_name} Redis Memory",
+                body="status=disabled",
+                recovery_title=f"[KORION] External Recovered - {alert_name} Redis Memory",
+                recovery_body="status=disabled",
+            )
+
+        raw_lines = []
+        for name in containers:
+            try:
+                status, health = self._docker_socket_container_status(name)
+                if status != "running":
+                    raw_lines.append(f"{name} status={status}")
+                    continue
+                exit_status, output = self._docker_socket_exec(name, ["redis-cli", "INFO", "memory"])
+                if exit_status < 200 or exit_status >= 300:
+                    raw_lines.append(f"{name} status=error error=docker_socket_exec_{exit_status}")
+                    continue
+                metrics = self._parse_redis_info_memory(output)
+                container_limit = self._docker_socket_container_memory_limit(name)
+                raw_lines.append(" ".join([
+                    name,
+                    "status=ok",
+                    f"used_memory={metrics.get('used_memory', '0')}",
+                    f"maxmemory={metrics.get('maxmemory', '0')}",
+                    f"container_limit={container_limit}",
+                    "host_memory=0",
+                    f"mem_fragmentation_ratio={metrics.get('mem_fragmentation_ratio', 'unknown')}",
+                    f"health={health}",
+                ]))
+            except Exception as exc:
+                raw_lines.append(f"{name} status=error error={type(exc).__name__}")
+
+        return self._redis_memory_result_from_lines(
+            service_name=service_name,
+            alert_name=alert_name,
+            target=f"dockerSocket:{self.foxya_docker_socket_path}",
+            containers=containers,
+            raw_lines=raw_lines,
+        )
+
+    def _parse_redis_info_memory(self, output: str) -> dict[str, str]:
+        metrics = {}
+        for line in output.splitlines():
+            key, separator, value = line.partition(":")
+            if not separator:
+                continue
+            metrics[key] = value.strip()
+        return metrics
 
     def _check_ssh_docker_critical_logs(
         self,
@@ -1291,6 +1420,12 @@ class Monitor:
         )
 
     def check_foxya_redis_memory(self) -> CheckResult:
+        if self.foxya_docker_check_mode == "socket":
+            return self._check_docker_socket_redis_memory(
+                service_name="foxya",
+                alert_name="Foxya",
+                containers=self.foxya_redis_containers,
+            )
         return self._check_ssh_redis_memory(
             service_name="foxya",
             alert_name="Foxya",

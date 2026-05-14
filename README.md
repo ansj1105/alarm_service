@@ -52,7 +52,7 @@ FOXYA_REDIS_MEMORY_CHECK_ENABLED=true
 FOXYA_REDIS_CONTAINERS=foxya-redis
 ```
 
-`socket` 모드는 `/var/run/docker.sock` 마운트가 필요합니다. `ssh` 모드는 컨테이너에서 SSH 키를 읽을 수 있어야 하고, 원격 `ubuntu` 계정이 `sudo docker ...`를 실행할 수 있어야 합니다.
+`socket` 모드는 `/var/run/docker.sock` 마운트가 필요합니다. Foxya Redis 메모리 체크도 socket 모드에서는 Docker socket exec로 Redis 정보를 읽습니다. `ssh` 모드는 컨테이너에서 SSH 키를 읽을 수 있어야 하고, 원격 `ubuntu` 계정이 `sudo docker ...`를 실행할 수 있어야 합니다.
 
 `offline_pay` 로그 감시를 켤 경우:
 ```bash
